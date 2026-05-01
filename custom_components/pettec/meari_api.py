@@ -43,7 +43,71 @@ RESULT_OK = "1001"
 RESULT_LOGGED_ELSEWHERE = "1023"  # "Your account logged in elsewhere..."
 
 # IoT property IDs (from APK IotConstants.java)
-IOT_PROP_PET_FEED2 = "850"
+#
+# Action / write properties
+IOT_PROP_PET_FEED2 = "850"        # value: '{"parts": <int>}' to dispense N portions
+#
+# Read+write toggles / controls
+IOT_PROP_CAM_ACTIVE = "118"       # sleepMode tri-state: 1=on, 0=off, 2=privacy
+IOT_PROP_RECORDING = "140"        # recordSwitch on/off
+IOT_PROP_MOTION_DET = "106"       # motionDetEnable on/off
+IOT_PROP_MOTION_SENS = "107"      # motionDetSensitivity 1..N
+IOT_PROP_HUMAN_DET = "108"        # humanDetEnable
+IOT_PROP_SOUND_DET = "109"        # soundDetEnable
+IOT_PROP_SOUND_SENS = "110"       # soundDetSensitivity
+IOT_PROP_CRY_DET = "111"          # cryDetEnable
+IOT_PROP_HUMAN_TRACK = "112"      # humanTrackEnable (PTZ cameras)
+IOT_PROP_PIR_DET = "150"          # PirDetEnable (battery cameras)
+IOT_PROP_PIR_SENS = "151"         # PirDetSensitivity
+IOT_PROP_PET_ALARM_ENABLE = "264" # petAlarmEnable (feeder)
+IOT_PROP_PET_MEOW = "320"         # petMeow on/off (feeder)
+#
+# Read-only state
+IOT_PROP_SD_STATUS = "114"            # int enum: 1=mounted/ok, 3=err, 4=full, 5=unformatted, 6=bad
+IOT_PROP_SD_CAPACITY = "115"          # string e.g. "59.463G"
+IOT_PROP_SD_REMAINING = "116"         # string e.g. "56.227G"
+IOT_PROP_POWER_TYPE = "153"           # 0=battery, 1=mains? (battery devices only)
+IOT_PROP_BATTERY_PERCENT = "154"      # int 0-100 (battery devices only)
+IOT_PROP_BATTERY_REMAINING = "155"    # int (battery hours/minutes left)
+IOT_PROP_CHARGE_STATUS = "156"        # int 0=not charging, 1+=charging
+IOT_PROP_WIFI_STRENGTH = "1007"       # int 0-100 (signal percent)
+IOT_PROP_FIRMWARE_CODE = "51"         # string firmware identifier
+IOT_PROP_FIRMWARE_VERSION = "52"      # string e.g. "6.2.0"
+IOT_PROP_FOOD_DET = "331"             # JSON {enable,start_time,stop_time}
+IOT_PROP_OUT_FOOD_DET = "337"         # int (minutes feeder has been "out of food")
+IOT_PROP_DESICCANT_INFO = "339"       # JSON {expiry_days, status}
+IOT_PROP_NEW_TODAY_FEED_PLAN = "344"  # JSON array [{time,count,enable}]
+IOT_PROP_FEED_PLAN_LIST = "237"       # JSON array (full week schedule)
+IOT_PROP_PET_THROW_WARNING = "236"    # petThrowWarning (feeder bowl tip)
+
+# Properties to fetch for the home dashboard. The /v2/app/iot/model/get/batch
+# endpoint accepts ANY props in this list and silently omits ones the device
+# doesn't have. Single-batch call for ALL devices, also works for dormant
+# battery cameras.
+BATCH_READ_PROPS: list[str] = [
+    # Power / battery
+    IOT_PROP_CAM_ACTIVE, IOT_PROP_POWER_TYPE, IOT_PROP_BATTERY_PERCENT,
+    IOT_PROP_BATTERY_REMAINING, IOT_PROP_CHARGE_STATUS, IOT_PROP_WIFI_STRENGTH,
+    # SD card
+    IOT_PROP_SD_STATUS, IOT_PROP_SD_CAPACITY, IOT_PROP_SD_REMAINING,
+    # Firmware
+    IOT_PROP_FIRMWARE_CODE, IOT_PROP_FIRMWARE_VERSION,
+    # Recording / detection toggles
+    IOT_PROP_RECORDING,
+    IOT_PROP_MOTION_DET, IOT_PROP_MOTION_SENS,
+    IOT_PROP_HUMAN_DET, IOT_PROP_SOUND_DET, IOT_PROP_SOUND_SENS,
+    IOT_PROP_CRY_DET, IOT_PROP_HUMAN_TRACK,
+    IOT_PROP_PIR_DET, IOT_PROP_PIR_SENS,
+    # Pet feeder
+    IOT_PROP_PET_THROW_WARNING, IOT_PROP_PET_ALARM_ENABLE, IOT_PROP_PET_MEOW,
+    IOT_PROP_FOOD_DET, IOT_PROP_OUT_FOOD_DET, IOT_PROP_DESICCANT_INFO,
+    IOT_PROP_NEW_TODAY_FEED_PLAN, IOT_PROP_FEED_PLAN_LIST,
+]
+
+# (Kept for backward compat with sensor.py / binary_sensor.py — they use these
+# names but receive data from the batch fetch via the coordinator now.)
+FEEDER_READ_PROPS = BATCH_READ_PROPS
+CAMERA_READ_PROPS = BATCH_READ_PROPS
 
 
 class MeariAuthError(Exception):
@@ -56,6 +120,14 @@ class MeariSessionBumpedError(Exception):
 
 class MeariApiError(Exception):
     """API call failed for some other reason."""
+
+
+class DeviceOfflineError(MeariApiError):
+    """Device is offline (Meari returned errid=404, reason=NotOnline).
+
+    Common for battery-powered cameras between motion-triggered wake events.
+    Callers should mark the entity unavailable rather than fail hard.
+    """
 
 
 # ---- crypto helpers ----------------------------------------------------------
@@ -278,43 +350,273 @@ class MeariClient:
         return str(adjusted_ms // 1000)
 
     @staticmethod
-    def _build_iot_params_b64(iot_props: dict[str, str]) -> str:
+    def _build_iot_params_b64(action: str, iot_payload) -> str:
+        """Build the base64-encoded params blob.
+
+        action='set': iot_payload should be a dict {prop_id: value}.
+        action='get': iot_payload should be a list [prop_id, ...].
+        """
         body = {
             "code": 100001,
-            "action": "set",
+            "action": action,
             "name": "iot",
-            "iot": iot_props,
+            "iot": iot_payload,
         }
         return base64.b64encode(json.dumps(body, separators=(",", ":")).encode()).decode()
 
-    async def set_iot_property(self, sn_num: str, props: dict[str, str]) -> dict[str, Any]:
-        """Send action=set for IoT properties on a device. props: {prop_id: value}."""
+    async def _iot_request(
+        self, sn_num: str, action: str, iot_payload
+    ) -> dict[str, Any]:
+        """Shared GET request to /openapi/device/config for both set and get."""
         if not self.session:
             raise MeariApiError("not logged in")
         path = "/openapi/device/config"
-        action = "set"
         expires = self._expires_str()
         sign_input = f"GET\n\n\n{expires}\n{path}\n{action}"
         signature = _hmac_sha1_b64(sign_input, self.session.access_key)
-
         query = {
             "accessid": self.session.access_id,
             "expires": expires,
             "signature": signature,
             "action": action,
             "deviceid": self._format_sn(sn_num),
-            "params": self._build_iot_params_b64(props),
+            "params": self._build_iot_params_b64(action, iot_payload),
+        }
+        url = self.session.openapi_domain.rstrip("/") + path
+        _LOGGER.debug("PetTec IoT → %s %s payload=%s", action, sn_num, iot_payload)
+        async with self._http.get(url, params=query) as resp:
+            text = await resp.text()
+            _LOGGER.debug("PetTec IoT ← HTTP %s body=%s", resp.status, text[:300])
+            try:
+                data = json.loads(text)
+            except json.JSONDecodeError as err:
+                raise MeariApiError(
+                    f"non-JSON response from {url}: {text[:200]}"
+                ) from err
+            return data
+
+    async def set_iot_property(
+        self, sn_num: str, props: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Write IoT properties on a device. props: {prop_id: value}.
+
+        Value types matter — the server accepts strings but silently ignores
+        them for primitive props (sleepMode, recording, etc.). Pass INTS for
+        primitive on/off and number values; pass STRINGS only for props whose
+        values are JSON sub-objects (e.g. petFeed2 takes '{"parts":1}').
+        """
+        data = await self._iot_request(sn_num, "set", props)
+        if isinstance(data, dict) and data.get("errid"):
+            raise MeariApiError(f"device config set failed: {data}")
+        return data
+
+    async def get_iot_properties(
+        self, sn_num: str, prop_ids: list[str]
+    ) -> dict[str, Any]:
+        """Read IoT properties on a device. Returns a dict {prop_id: value}.
+
+        Quirks:
+        - The server SILENTLY drops properties the device doesn't track. Always
+          handle missing keys via .get(prop, default) downstream.
+        - When the device is offline (esp. battery cams), the server returns
+          {"errid": 404, "reason": "NotOnline", ...}. We surface that as a
+          DeviceOfflineError so callers can mark entities unavailable.
+        """
+        data = await self._iot_request(sn_num, "get", prop_ids)
+        if isinstance(data, dict) and data.get("errid"):
+            err = data.get("errid")
+            reason = data.get("reason", "")
+            if err == 404 and reason == "NotOnline":
+                raise DeviceOfflineError(f"{sn_num} is offline")
+            raise MeariApiError(f"device config get failed: {data}")
+        # Successful shape: {"code":..., "action":"get", "name":"iot", "iot":{...}}
+        iot = data.get("iot") if isinstance(data, dict) else None
+        if not isinstance(iot, dict):
+            return {}
+        return iot
+
+    # ---- camera control (DP 118) --------------------------------------------
+    #
+    # Tri-state: 1=on, 0=off, 2=privacy. v0.2 only flips on/off; privacy is
+    # surfaced through `_state_value_is_active()` so a future select entity
+    # can map all three values cleanly.
+
+    @staticmethod
+    def _state_value_is_active(value) -> bool | None:
+        """Map prop 118 (sleepMode) raw value to whether camera is ACTIVE.
+
+        Empirically verified by toggling cameras in the Snoop Cube app:
+        - 0 → sleep mode OFF → camera is **active** → True
+        - 1 → sleep mode ON  → camera is **inactive** → False
+        - 2 → privacy mode   → camera is **inactive** → False
+        - anything else / None → None (unknown)
+
+        Note the inversion: prop 118 reads "is sleep mode enabled?", so
+        active==True corresponds to value==0.
+        """
+        if value is None:
+            return None
+        try:
+            v = int(value)
+        except (TypeError, ValueError):
+            return None
+        if v == 0:
+            return True
+        if v in (1, 2):
+            return False
+        return None
+
+    async def set_camera_active(self, sn_num: str, on: bool) -> dict[str, Any]:
+        """Enable (active) or disable a camera (writes inverted DP 118).
+
+        Active==True writes 0 (sleep mode off). Active==False writes 1
+        (sleep mode on). Privacy mode (2) is not exposed by this method;
+        a future v0.3 select entity will write that value when needed.
+        """
+        return await self.set_iot_property(
+            sn_num, {IOT_PROP_CAM_ACTIVE: 0 if on else 1}
+        )
+
+    async def set_toggle(self, sn_num: str, prop_id: str, on: bool) -> dict[str, Any]:
+        """Generic on/off toggle of an IoT property. Sends int 1/0."""
+        return await self.set_iot_property(sn_num, {prop_id: 1 if on else 0})
+
+    async def set_number(self, sn_num: str, prop_id: str, value: int) -> dict[str, Any]:
+        """Generic integer write to an IoT property."""
+        return await self.set_iot_property(sn_num, {prop_id: int(value)})
+
+    async def get_iot_batch(
+        self, sn_list: list[str], prop_ids: list[str]
+    ) -> dict[str, dict[str, Any]]:
+        """Batch-fetch IoT properties for multiple devices in one cloud call.
+
+        This hits the regional API server (NOT the openapi domain). It's the
+        same endpoint the Snoop Cube home view uses. Critically, **it works
+        even for dormant battery cameras** — the openapi /device/config call
+        returns errid=404 for them, but this one returns cached state
+        including battery/wifi.
+
+        Returns: {sn_with_full_prefix_dropped: {prop_id: value, ...}, ...}
+        """
+        if not self.session:
+            raise MeariApiError("not logged in")
+        # snIdentifier = {"<full_sn>": "comma,separated,prop,ids", ...}
+        # The endpoint expects FULL SNs (with "ppsl"/"ppsc" prefix), not the
+        # stripped form used by the openapi /device/config endpoint.
+        prop_csv = ",".join(prop_ids)
+        sn_identifier = {sn: prop_csv for sn in sn_list}
+        body = self._signed_body({
+            "snIdentifier": json.dumps(sn_identifier, separators=(",", ":"))
+        })
+        api_path = "/v2/app/iot/model/get/batch"
+        sign_path = "/ppstrongs" + api_path
+        if self.session.user_token:
+            headers = _sign_headers(
+                sign_path, self.session.user_token, self.session.user_token
+            )
+        else:
+            headers = _sign_headers(sign_path, APP_KEY, APP_SECRET)
+        url = self.session.base_url + api_path
+        _LOGGER.debug("PetTec batch → %s for %d devices", url, len(sn_list))
+        async with self._http.get(url, params=body, headers=headers) as resp:
+            text = await resp.text()
+            try:
+                data = json.loads(text)
+            except json.JSONDecodeError as err:
+                raise MeariApiError(f"non-JSON batch response: {text[:200]}") from err
+        rc = data.get("resultCode") if isinstance(data, dict) else None
+        if rc != RESULT_OK:
+            if rc == RESULT_LOGGED_ELSEWHERE:
+                raise MeariSessionBumpedError(f"batch IoT: resultCode={rc}")
+            raise MeariApiError(f"batch IoT failed: resultCode={rc}")
+        result = data.get("result") if isinstance(data, dict) else None
+        if not isinstance(result, dict):
+            return {}
+        return {sn: props for sn, props in result.items() if isinstance(props, dict)}
+
+    async def wake_device(self, sn_num: str) -> dict[str, Any]:
+        """Wake a dormant battery camera.
+
+        Path: GET /openapi/device/awaken?action=set&deviceid=<formatSn>&sid=...
+
+        Sends a wake-up command via the cloud. The camera responds within a
+        few seconds (usually <2s) and transitions from dormancy → online.
+        Required before issuing any IoT write to a sleeping battery cam,
+        because /openapi/device/config returns 404 NotOnline for dormant
+        devices.
+        """
+        if not self.session:
+            raise MeariApiError("not logged in")
+        path = "/openapi/device/awaken"
+        action = "set"
+        expires = self._expires_str()
+        sign_input = f"GET\n\n\n{expires}\n{path}\n{action}"
+        signature = _hmac_sha1_b64(sign_input, self.session.access_key)
+        formatted_sn = self._format_sn(sn_num)
+        # sid: device id + millis, max 30 chars
+        sid = (formatted_sn + str(_now_ms()))[:30]
+        query = {
+            "accessid": self.session.access_id,
+            "expires": expires,
+            "signature": signature,
+            "action": action,
+            "deviceid": formatted_sn,
+            "sid": sid,
+        }
+        url = self.session.openapi_domain.rstrip("/") + path
+        _LOGGER.info("PetTec: wake %s", sn_num)
+        async with self._http.get(url, params=query) as resp:
+            text = await resp.text()
+            try:
+                return json.loads(text)
+            except json.JSONDecodeError:
+                return {"_raw": text}
+
+    async def get_device_status(self, sn_num: str) -> str:
+        """Liveness check via /openapi/device/status?action=query.
+
+        Returns one of:
+          - "online"    — fully reachable
+          - "dormancy"  — battery cam in low-power sleep (still controllable)
+          - "offline"   — Meari can't reach the device (powered off / Wi-Fi loss)
+          - "notfound"  — device unknown or deregistered
+          - "unknown"   — couldn't parse response
+
+        This is a separate cloud endpoint from the IoT openapi we use for
+        get/set props. The IoT openapi can return a *cached* property value
+        (esp. config-only props like 118) even when the camera itself is
+        unreachable, so it's NOT a reliable liveness signal on its own.
+        """
+        if not self.session:
+            raise MeariApiError("not logged in")
+        path = "/openapi/device/status"
+        action = "query"
+        expires = self._expires_str()
+        sign_input = f"GET\n\n\n{expires}\n{path}\n{action}"
+        signature = _hmac_sha1_b64(sign_input, self.session.access_key)
+        query = {
+            "accessid": self.session.access_id,
+            "expires": expires,
+            "signature": signature,
+            "action": action,
+            "deviceid": self._format_sn(sn_num),
         }
         url = self.session.openapi_domain.rstrip("/") + path
         async with self._http.get(url, params=query) as resp:
             text = await resp.text()
             try:
                 data = json.loads(text)
-            except json.JSONDecodeError as err:
-                raise MeariApiError(f"non-JSON response from {url}: {text[:200]}") from err
-            if isinstance(data, dict) and data.get("errid"):
-                raise MeariApiError(f"device config set failed: {data}")
-            return data
+            except json.JSONDecodeError:
+                _LOGGER.debug("PetTec status non-JSON: %s", text[:120])
+                return "unknown"
+        if not isinstance(data, dict):
+            return "unknown"
+        if data.get("errid"):
+            return "offline"
+        status = data.get("status")
+        if isinstance(status, str):
+            return status
+        return "unknown"
 
     async def feed_one_portion(self, sn_num: str, portions: int = 1) -> dict[str, Any]:
         """Trigger N portions on a Cam Buddy (or compatible feeder)."""

@@ -3,23 +3,25 @@
 [![hacs_badge](https://img.shields.io/badge/HACS-Custom-orange.svg)](https://github.com/hacs/integration)
 
 A Home Assistant custom integration for the [PetTec Cam Buddy](https://pettec.de/products/pettec-cam-buddy-inkl-futterautomat)
-pet feeder, exposing a **"Feed one portion"** button you can press from the dashboard
-or trigger from any automation.
+feeder and the rest of the **Snoop Cube** camera lineup (Cam Free, Cam Lite, Cam 360, etc).
 
 The integration talks to PetTec's cloud (the same backend the **Snoop Cube** mobile app
 uses — operated by [Meari](https://www.meari.com.cn/) under the CloudEdge brand).
 
 ## Status
 
-- ✅ Cam Buddy: feed one portion — works
-- 🟦 Other PetTec / Snoop Cube cameras: discovered automatically, but no controls yet
+- ✅ Pet Cam Buddy — feed control, full state visibility, all detection toggles
+- ✅ All other PetTec cameras — on/off, recording, motion/human/sound/PIR/cry detection, sensitivity sliders, SD card sensors, Wi-Fi, battery, firmware
+- 🟦 Live video / playback / schedule editing — not yet (v0.3+)
 
 ## Features
 
 - Single config flow (email + password)
-- Automatic discovery of all feeders on the account
-- One button entity per feeder
-- Multi-region: works with EU and global Meari endpoints
+- Automatic discovery of all cameras + feeders on the account, including shared (`asFriend`) devices
+- Up to **20+ entities per device**: switch / number / sensor / binary_sensor / button
+- Hourly cloud polling (configurable in code) — sufficient since feeder/camera state changes are infrequent
+- Transparent **wake-on-write** for dormant battery cameras
+- Multi-region: works with EU, US, and China Meari endpoints (auto-detected from login)
 - Auto-retry if the cloud invalidates a session
 
 ## Installation
@@ -56,10 +58,30 @@ The config flow asks for:
 
 ## Entities
 
-For each discovered feeder you'll get:
+Per discovered device (some are conditional — battery sensors only on battery
+cams, pet alarm only on the feeder, etc.):
 
-- **`button.<device_name>_feed_one_portion`** — pressing it tells the feeder to dispense
-  one portion. The portion size is whatever you set in the Snoop Cube app for "manual feed".
+| Type | Entity | Notes |
+|---|---|---|
+| **button** | `feed_one_portion` | Cam Buddy only — dispenses one portion |
+| **switch** | `active` | Camera on/off (sleepMode) |
+| **switch** | `recording` | SD-card recording on/off |
+| **switch** | `motion_detection` | Motion alerts on/off |
+| **switch** | `human_detection` | Human-shape alerts |
+| **switch** | `sound_detection` | Sound alerts |
+| **switch** | `cry_detection` | Cry/whining alerts |
+| **switch** | `human_tracking` | Auto-follow (PTZ cams only) |
+| **switch** | `pir_detection` | PIR sensor (battery cams only) |
+| **switch** | `pet_alarm` | Feeder bowl-tip alarm enable |
+| **switch** | `pet_meow` | Pet sound mode (feeder) |
+| **number** | `motion_sensitivity` / `sound_sensitivity` / `pir_sensitivity` | 0–10 sliders |
+| **sensor** | `battery` | Battery cams: % |
+| **sensor** | `wifi_strength` | Signal % |
+| **sensor** | `firmware_version` | Diagnostic |
+| **sensor** | `sd_card_status` / `sd_card_capacity` / `sd_card_remaining` | SD card |
+| **sensor** | `today_feed_count` / `next_feed_time` / `food_out_minutes` / `desiccant_info` | Feeder only |
+| **binary_sensor** | `charging` | Battery cams only |
+| **binary_sensor** | `food_empty` / `desiccant_expired` / `pet_throw_warning` | Feeder only |
 
 ## Use in automations
 
@@ -77,24 +99,45 @@ actions:
       entity_id: button.pet_cam_buddy_feed_one_portion
 ```
 
+```yaml
+# Disable cameras when "home" mode is active
+alias: Privacy when home
+triggers:
+  - trigger: state
+    entity_id: input_boolean.away_mode
+    to: "off"
+actions:
+  - action: switch.turn_off
+    target:
+      entity_id:
+        - switch.wohnzimmer_cam_active
+        - switch.schlafzimmer_cam_active
+```
+
 ## How it works
 
-The Snoop Cube app authenticates against `apis.cloudedge360.com` (or a regional
-mirror like `apis-eu-frankfurt.cloudedge360.com`), receives a `userToken` and
-`pfKey` (per-tenant access credentials), then issues feeder commands as IoT
-property writes against `openapi-<region>.mearicloud.com/openapi/device/config`.
+Authentication: 3DES password + HMAC-SHA1 signed body params against
+`apis.cloudedge360.com` → returns `userToken` + `pfKey` (per-tenant access
+credentials). Subsequent calls hit a regional mirror auto-detected from
+the login response.
 
-The "feed one portion" command is IoT property `850` (petFeed2) with payload
-`{"parts": 1}`. See [`meari_api.py`](custom_components/pettec/meari_api.py) for the full implementation.
+State reads use `/v2/app/iot/model/get/batch` — a single batch call covers
+all devices, including dormant battery cams (which return cached state).
+State writes go to `/openapi/device/config?action=set`. Battery cams in
+`dormancy` are transparently woken via `/openapi/device/awaken` before
+writes.
+
+Feed: IoT property `850` (petFeed2) with payload `{"parts": 1}`.
+Camera on/off: IoT property `118` (sleepMode) — note the inversion, value 0
+means "active". See [`meari_api.py`](custom_components/pettec/meari_api.py)
+for the full reference.
 
 ## Limitations
 
 - The Meari cloud allows only **one active session per account**. If you (or your
   phone) log in to the same account, HA's session is invalidated. Use a dedicated
   shared account for HA.
-- This integration uses cloud APIs only — it does not stream video, query SD card
-  recording, control PTZ, or read sensor values. Those features are technically
-  feasible but out of scope for v0.1.
+- Cloud-only — no live video, no playback browsing, no schedule editing yet.
 - This integration is not affiliated with PetTec or Meari.
 
 ## Troubleshooting

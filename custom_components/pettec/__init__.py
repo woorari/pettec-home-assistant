@@ -5,6 +5,8 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 
+import aiohttp
+
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import Platform
 from homeassistant.core import HomeAssistant
@@ -20,32 +22,46 @@ from .const import (
     DEFAULT_PHONE_CODE,
     DOMAIN,
 )
-from .meari_api import MeariApiError, MeariAuthError, MeariClient, MeariSessionBumpedError
+from .coordinator import PettecCoordinator
+from .meari_api import (
+    MeariApiError,
+    MeariAuthError,
+    MeariClient,
+    MeariSessionBumpedError,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
-PLATFORMS: list[Platform] = [Platform.BUTTON]
+PLATFORMS: list[Platform] = [
+    Platform.BUTTON,
+    Platform.SENSOR,
+    Platform.BINARY_SENSOR,
+    Platform.SWITCH,
+    Platform.NUMBER,
+]
 
 
 @dataclass
 class PettecData:
+    """Runtime data attached to the config entry."""
+
     client: MeariClient
-    feeders: list[dict]  # raw device dicts from get_device_list
+    feeders: list[dict]      # subset of all_devices that are feeders
+    all_devices: list[dict]  # every camera + feeder for the account
+    coordinator: PettecCoordinator
 
 
 type PettecConfigEntry = ConfigEntry[PettecData]
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: PettecConfigEntry) -> bool:
-    """Login, discover feeders, store on entry, forward to button platform."""
-    # Dedicated aiohttp session — isolates our auth state from HA's shared
-    # session (which carries cookies/state from other integrations and seems
-    # to interfere with Meari's per-token session tracking).
-    import aiohttp
+    """Login, discover devices, build coordinator, forward to platforms."""
+    # Dedicated aiohttp session — isolates our auth from HA's shared session,
+    # which interferes with Meari's per-token session tracking.
     http = async_create_clientsession(
         hass,
         cookie_jar=aiohttp.DummyCookieJar(),
-        headers={"User-Agent": "PettecHA/0.1"},
+        headers={"User-Agent": "PettecHA/0.2"},
     )
     client = MeariClient(
         http=http,
@@ -56,24 +72,61 @@ async def async_setup_entry(hass: HomeAssistant, entry: PettecConfigEntry) -> bo
     )
     try:
         await client.login()
-        feeders = await client.list_feeders_with_retry()
+        # Pull the FULL device list (cameras + feeders) so we can attach a
+        # camera-active switch to every device. list_feeders_with_retry uses
+        # the same call internally; do it once here and partition.
+        all_devices = await _fetch_all_devices_with_retry(client)
     except MeariAuthError as err:
         raise ConfigEntryAuthFailed(str(err)) from err
     except MeariSessionBumpedError as err:
-        # The Meari cloud invalidated our token. Either another login on
-        # the same account happened, or the request didn't sign cleanly.
-        # Surface as not-ready so HA retries on a backoff.
         raise ConfigEntryNotReady(
             "Meari session was invalidated. HA will retry."
         ) from err
     except MeariApiError as err:
         raise ConfigEntryNotReady(str(err)) from err
 
-    _LOGGER.info("PetTec setup: found %d feeder(s)", len(feeders))
-    entry.runtime_data = PettecData(client=client, feeders=feeders)
+    feeders = [d for d in all_devices if MeariClient.is_feeder(d)]
+    _LOGGER.info(
+        "PetTec setup: %d device(s), %d feeder(s)", len(all_devices), len(feeders)
+    )
+
+    coordinator = PettecCoordinator(hass, client, all_devices)
+    await coordinator.async_config_entry_first_refresh()
+
+    entry.runtime_data = PettecData(
+        client=client,
+        feeders=feeders,
+        all_devices=all_devices,
+        coordinator=coordinator,
+    )
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     return True
+
+
+async def _fetch_all_devices_with_retry(
+    client: MeariClient, retries: int = 5
+) -> list[dict]:
+    """get_device_list() with the same auto-relog retry as list_feeders."""
+    import asyncio
+    for attempt in range(retries + 1):
+        try:
+            resp = await client.get_device_list()
+            out: list[dict] = []
+            for bucket in ("ipc", "snap"):
+                out.extend(resp.get(bucket) or [])
+            return out
+        except MeariSessionBumpedError:
+            if attempt == retries:
+                raise
+            _LOGGER.info(
+                "PetTec: session bumped (attempt %d/%d) — re-logging in",
+                attempt + 1,
+                retries,
+            )
+            await asyncio.sleep(0.5 + attempt * 0.5)
+            await client.login()
+    return []
 
 
 async def async_unload_entry(hass: HomeAssistant, entry: PettecConfigEntry) -> bool:

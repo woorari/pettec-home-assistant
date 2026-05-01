@@ -24,9 +24,10 @@ async def async_setup_entry(
 ) -> None:
     """Create a Feed One Portion button for each feeder."""
     data = entry.runtime_data
-    entities: list[FeedOnePortionButton] = []
-    for feeder in data.feeders:
-        entities.append(FeedOnePortionButton(data.client, feeder))
+    entities: list[FeedOnePortionButton] = [
+        FeedOnePortionButton(data.client, data.coordinator, feeder)
+        for feeder in data.feeders
+    ]
     async_add_entities(entities)
 
 
@@ -37,8 +38,9 @@ class FeedOnePortionButton(ButtonEntity):
     _attr_translation_key = "feed_one_portion"
     _attr_icon = "mdi:food-drumstick"
 
-    def __init__(self, client: MeariClient, device: dict) -> None:
+    def __init__(self, client: MeariClient, coordinator, device: dict) -> None:
         self._client = client
+        self._coordinator = coordinator
         self._sn = device["snNum"]
         device_name = device.get("deviceName") or "PetTec Feeder"
         firmware = device.get("deviceVersionID") or ""
@@ -56,9 +58,6 @@ class FeedOnePortionButton(ButtonEntity):
     async def async_press(self) -> None:
         """Dispense one portion."""
         _LOGGER.info("PetTec: feed one portion → %s (%s)", self._attr_name, self._sn)
-        # The IoT openapi (where this command lands) doesn't validate userToken,
-        # so it almost always succeeds on the first try. We retry on
-        # MeariAuthError just in case (and re-login if so).
         try:
             await self._client.feed_one_portion(self._sn, portions=1)
         except (MeariAuthError, MeariSessionBumpedError):
@@ -67,3 +66,5 @@ class FeedOnePortionButton(ButtonEntity):
             await self._client.feed_one_portion(self._sn, portions=1)
         except MeariApiError as err:
             raise HomeAssistantError(f"Feed command failed: {err}") from err
+        # Trigger a coordinator refresh so today_feed_count etc. update soon.
+        await self._coordinator.async_request_refresh()

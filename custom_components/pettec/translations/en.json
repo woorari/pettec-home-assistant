@@ -15,7 +15,7 @@
       "invalid_auth": "Invalid email or password.",
       "cannot_connect": "Could not reach the PetTec / Meari cloud.",
       "logged_elsewhere": "Meari rejected our session. If the Snoop Cube app is also signed in to this account, log it out (use a dedicated account for HA).",
-      "no_feeders": "Login worked, but no feeder devices (e.g. Cam Buddy) were found on this account.",
+      "no_feeders": "Login worked, but no devices were found on this account.",
       "unknown": "Unexpected error."
     },
     "abort": {
@@ -24,9 +24,42 @@
   },
   "entity": {
     "button": {
-      "feed_one_portion": {
-        "name": "Feed one portion"
-      }
+      "feed_one_portion": { "name": "Feed one portion" }
+    },
+    "switch": {
+      "camera_active": { "name": "Active" },
+      "recording": { "name": "Recording" },
+      "motion_detection": { "name": "Motion detection" },
+      "human_detection": { "name": "Human detection" },
+      "sound_detection": { "name": "Sound detection" },
+      "cry_detection": { "name": "Cry detection" },
+      "human_tracking": { "name": "Human tracking" },
+      "pir_detection": { "name": "PIR detection" },
+      "pet_alarm": { "name": "Pet alarm" },
+      "pet_meow": { "name": "Pet sound mode" }
+    },
+    "sensor": {
+      "today_feed_count": { "name": "Today's feed count" },
+      "next_feed_time": { "name": "Next scheduled feed" },
+      "food_out_minutes": { "name": "Food out" },
+      "desiccant_info": { "name": "Desiccant info" },
+      "sd_card_status": { "name": "SD card status" },
+      "sd_card_capacity": { "name": "SD card capacity" },
+      "sd_card_remaining": { "name": "SD card remaining" },
+      "battery": { "name": "Battery" },
+      "wifi_strength": { "name": "Wi-Fi strength" },
+      "firmware_version": { "name": "Firmware version" }
+    },
+    "binary_sensor": {
+      "food_empty": { "name": "Food empty" },
+      "desiccant_expired": { "name": "Desiccant expired" },
+      "pet_throw_warning": { "name": "Bowl tipped" },
+      "charging": { "name": "Charging" }
+    },
+    "number": {
+      "motion_sensitivity": { "name": "Motion sensitivity" },
+      "sound_sensitivity": { "name": "Sound sensitivity" },
+      "pir_sensitivity": { "name": "PIR sensitivity" }
     }
   }
 }
